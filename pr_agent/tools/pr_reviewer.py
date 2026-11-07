@@ -408,7 +408,15 @@ class PRReviewer:
             # This intent applies to the review only - never to status comments or the output of other tools.
             review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
             state_block_reason = getattr(self, "_review_state_block_reason", None)
-            if state_blocked and (
+            native_publisher = getattr(self.git_provider, "publish_review_result", None)
+            if callable(native_publisher) and native_publisher(
+                pr_review, complete=not (
+                    state_blocked or partial_review_error or self.review_failed_chunk_count
+                    or getattr(self, "remaining_files_list", ()) or self.partial_files_list
+                )
+            ) is True:
+                pass
+            elif state_blocked and (
                 state_block_reason == _STATE_BLOCK_INVALID_MARKER
                 or (
                     state_block_reason == _STATE_BLOCK_SIZE
@@ -1682,11 +1690,12 @@ class PRReviewer:
         """
         Checks if we can run incremental review according the various configurations and previous review.
         """
-        # checking if running is auto mode but there are no new commits
-        if self.is_auto and not self.incremental.first_new_commit_sha:
-            get_logger().info(f"Incremental review is enabled for {self.pr_url} but there are no new commits")
+        # No anchor (None) requires a full fallback, including in auto mode. An initialized
+        # provider with no first new commit keeps the existing auto-skip behavior.
+        if (self.is_auto and not self.incremental.first_new_commit_sha
+                and getattr(self.incremental, "commits_range", ()) is not None):
+            get_logger().info("Incremental review skipped: no new commits")
             return False
-
         if not hasattr(self.git_provider, "get_incremental_commits"):
             get_logger().info(f"Incremental review is not supported for {get_settings().config.git_provider}")
             return False

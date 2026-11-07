@@ -696,6 +696,10 @@ class GitProvider(ABC):
     def get_incremental_commits(self, is_incremental) -> None:
         return None
 
+    def publish_review_result(self, body: str, *, complete: bool) -> bool:
+        """Optionally publish a native review with an atomic successful-review checkpoint."""
+        return False
+
     @abstractmethod
     def publish_description(self, pr_title: str, pr_body: str) -> None:
         """Publish the pull request title and description.

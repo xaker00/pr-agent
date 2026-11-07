@@ -24,6 +24,7 @@ from pr_agent.git_providers.git_provider import (
     cache_languages,
     redact_credentials,
 )
+from pr_agent.git_providers.gitea_incremental import GiteaIncrementalMixin
 from pr_agent.git_providers.request_timeout import get_http_request_timeout
 from pr_agent.log import get_logger
 from pr_agent.mosaico.diff_provider import parse_unified_diff
@@ -70,7 +71,7 @@ def _with_default_request_timeout(call_api):
     return call_api_with_timeout
 
 
-class GiteaProvider(GitProvider):
+class GiteaProvider(GiteaIncrementalMixin, GitProvider):
     def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
         pr = self.pr
         if pr is None:
@@ -449,12 +450,14 @@ class GiteaProvider(GitProvider):
 
     def publish_inline_comments(self, comments: list[dict[str, Any]],body : str = "Inline comment") -> bool:
         try:
+            if not self._incremental_inline_comments_valid(comments):
+                return False
             response = self.repo_api.create_inline_comment(
                 owner=self.owner,
                 repo=self.repo,
                 pr_number=self.pr_number if self.enabled_pr else self.issue_number,
-                body=body,
-                commit_id=self.last_commit.sha if self.last_commit else "",
+                body=self._strip_review_checkpoint(body),
+                commit_id=getattr(self, "sha", "") or (self.last_commit.sha if self.last_commit else ""),
                 comments=comments
             )
         except ApiException as e:
@@ -631,6 +634,9 @@ class GiteaProvider(GitProvider):
 
     def get_diff_files(self) -> list[FilePatchInfo]:
         """Get files that were modified in the PR"""
+        if (getattr(self, "_incremental_diff_files", None) is not None
+                and self.incremental.is_incremental):
+            return self._incremental_diff_files
         if self.diff_files is not None:
             return self.diff_files
 
@@ -1099,6 +1105,34 @@ class GiteaProvider(GitProvider):
         return self.base_sha or self.base_ref
 
 class RepoApi(giteapy.RepositoryApi):
+    def incremental_bytes(self, path: str, query_params=None):
+        """Read fixed-origin metadata without following authenticated redirects."""
+        if not path.startswith(("/repos/", "/user")) or "?" in path or "#" in path:
+            raise ValueError("Invalid incremental API path")
+        url = self.api_client.configuration.host.rstrip("/") + path
+        response = self.api_client.rest_client.pool_manager.request(
+            "GET", url, fields=query_params,
+            headers={"Authorization": self.api_client.configuration.api_key["Authorization"]},
+            redirect=False, timeout=get_http_request_timeout(),
+        )
+        if response.status != 200:
+            raise ValueError("Gitea incremental metadata request failed")
+        return response.data
+
+    def incremental_json(self, path: str, query_params=None):
+        return json.loads(self.incremental_bytes(path, query_params).decode("utf-8"))
+
+    def incremental_pages(self, path: str) -> list:
+        items = []
+        for page in range(1, 1001):
+            batch = self.incremental_json(path, [("page", page), ("limit", 50)])
+            if not isinstance(batch, list):
+                raise ValueError("Invalid incremental metadata page")
+            if not batch:
+                return items
+            items.extend(batch)
+        raise ValueError("Incremental metadata pagination limit exceeded")
+
     def __init__(self, client: giteapy.ApiClient):
         self.repository = giteapy.RepositoryApi(client)
         self.issue = giteapy.IssueApi(client)

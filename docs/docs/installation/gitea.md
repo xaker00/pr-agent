@@ -20,7 +20,7 @@ sidebar_position: 8
 4. Clone this repository:
 
     ```bash
-    git clone https://github.com/the-pr-agent/pr-agent.git
+    git clone https://github.com/xaker00/pr-agent.git
     cd pr-agent
     ```
 
@@ -76,3 +76,38 @@ PR-Agent stops the command when Gitea cannot supply complete, valid changed-file
 When `CONFIG.PUBLISH_OUTPUT` is enabled, PR-Agent attempts to post a **PR-Agent command was not run** notice with a Gitea-specific explanation. Publishing this notice is best effort; it may not appear if the provider cannot post it.
 
 Retry the command. If the problem persists, inspect the pull request's changed files and diff in Gitea.
+
+## Incremental reviews in this fork
+
+The `xaker00/pr-agent` fork supports `/review -i` (CLI: `review -i`) on Gitea and Forgejo.
+This extension is maintained in the fork; it is not part of the published upstream Docker image.
+Build the fork to use it. No existing deployment is changed automatically.
+
+The first run reviews the full PR. Subsequent runs use the last successfully published, complete
+native review by the token's authenticated user, with a PR-Agent checkpoint matching that review's
+commit ID and the current target SHA. Ordinary issue comments, other users' reviews, pending reviews,
+failure messages, and partial review results cannot advance the checkpoint. Reading the authenticated
+identity (`GET /user`) requires the token's user-read permission on servers enforcing scoped tokens.
+Use a dedicated bot account: reviews published with that account's credentials are trusted.
+
+Incremental model input contains the **net changes between the reviewed SHA and the captured head**,
+not full-PR patches filtered by filename or concatenated commit patches. Complete comparison metadata
+and parent links establish a linear history; UTF-8 file contents are read at immutable SHAs and used
+to construct unified hunks. This also handles additions, deletions, and reverting an earlier PR change.
+The usual ignore rules and review size/token limits still apply. A result omitting files or failed
+chunks is published without a new checkpoint. An already-reviewed head or empty net delta makes no
+model call. The existing incremental commit/time thresholds still apply.
+
+Missing/unsupported APIs, incomplete file metadata, non-UTF-8 contents, changed target SHAs, merges,
+rebases, and unreachable anchors conservatively trigger a full PR review, labeled as a fallback in
+the published result. No timestamp-only anchor guessing is used. Requests use the configured API
+origin and TLS settings and do not follow authenticated redirects; `GITEA.WEB_URL` is only for links.
+
+Gitea review summaries are submitted native `COMMENT` reviews with an explicit head commit ID. The
+checkpoint is included atomically in that review, not posted before a model result or in a separate
+success comment. Unlike the generic issue-comment publisher, this path appends native reviews rather
+than editing a persistent summary (`pr_reviewer.persistent_comment` does not replace old native reviews).
+Before publication, the current head and target are checked again; a changed PR fails the run without
+advancing the checkpoint. Incremental inline findings use current-head new-side line numbers and are
+posted only when those lines also belong to the full PR diff; other findings remain in the summary.
+`/improve -i` is not enabled by this extension.

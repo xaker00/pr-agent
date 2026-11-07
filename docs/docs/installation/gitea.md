@@ -83,12 +83,16 @@ The `xaker00/pr-agent` fork supports `/review -i` (CLI: `review -i`) on Gitea an
 This extension is maintained in the fork; it is not part of the published upstream Docker image.
 Build the fork to use it. No existing deployment is changed automatically.
 
-The first run reviews the full PR. Subsequent runs use the last successfully published, complete
+The first run reviews the full PR. Subsequent runs select the greatest-ID eligible, complete
 native review by the token's authenticated user, with a PR-Agent checkpoint matching that review's
 commit ID and the current target SHA. Ordinary issue comments, other users' reviews, pending reviews,
 failure messages, and partial review results cannot advance the checkpoint. Reading the authenticated
 identity (`GET /user`) requires the token's user-read permission on servers enforcing scoped tokens.
 Use a dedicated bot account: reviews published with that account's credentials are trusted.
+Review IDs follow the extension's normal append-only publication order; a server reusing an older
+pending review can cause an older checkpoint to be selected and changes to be reviewed again.
+Review listing follows the advertised underlying record count, including privacy-filtered empty
+pages. Missing/inconsistent counts or more than 1,000 underlying reviews cause full fallback.
 
 Incremental model input contains the **net changes between the reviewed SHA and the captured head**,
 not full-PR patches filtered by filename or concatenated commit patches. Complete comparison metadata
@@ -107,7 +111,10 @@ Gitea review summaries are submitted native `COMMENT` reviews with an explicit h
 checkpoint is included atomically in that review, not posted before a model result or in a separate
 success comment. Unlike the generic issue-comment publisher, this path appends native reviews rather
 than editing a persistent summary (`pr_reviewer.persistent_comment` does not replace old native reviews).
-Before publication, the current head and target are checked again; a changed PR fails the run without
-advancing the checkpoint. Incremental inline findings use current-head new-side line numbers and are
+Before publication, the current head and target are checked again; an observed change fails the run
+without advancing the checkpoint. This is not server-side compare-and-swap: a push after that check
+can still accept a review attached to the captured older head. Its checkpoint remains that captured
+SHA, and a changed target invalidates it on the next run. Incremental inline findings use
+captured-head new-side line numbers and are
 posted only when those lines also belong to the full PR diff; other findings remain in the summary.
 `/improve -i` is not enabled by this extension.

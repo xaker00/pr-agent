@@ -191,16 +191,43 @@ def test_publication_failure_or_head_race_never_advances_checkpoint(provider, ch
         provider.repo_api.create_inline_comment.assert_not_called()
 
 
-def test_review_pages_continue_after_server_capped_short_page():
+def _review_page(batch, total):
+    return SimpleNamespace(data=json.dumps(batch).encode(), headers={"X-Total-Count": str(total)})
+
+
+def test_review_pages_use_one_record_to_verify_server_capped_range():
     api = RepoApi(MagicMock())
-    api.incremental_json = MagicMock(side_effect=[[review()], [review(HEAD)], []])
+    api.incremental_response = MagicMock(side_effect=[_review_page([review()], 2), _review_page([review(HEAD)], 2)])
     assert len(api.incremental_pages("/repos/owner/repo/pulls/1/reviews")) == 2
-    assert api.incremental_json.call_args_list[-1].args[1][0] == ("page", 3)
+    assert api.incremental_response.call_args_list[-1].args[1] == [("page", 2), ("limit", 1)]
+
+
+def test_empty_private_review_page_does_not_hide_later_checkpoint(provider):
+    api = RepoApi(MagicMock())
+    api.incremental_response = MagicMock(side_effect=[_review_page([], 2), _review_page([review()], 2)])
+    provider.repo_api.incremental_pages = api.incremental_pages
+    incremental = IncrementalPR(True)
+    provider.get_incremental_commits(incremental)
+    assert incremental.first_new_commit_sha == HEAD
+    assert api.incremental_response.call_count == 2
+
+
+@pytest.mark.parametrize("failure", ["missing", "changing", "excessive"])
+def test_unverifiable_review_pagination_fails_closed(failure):
+    api = RepoApi(MagicMock())
+    responses = [_review_page([], 2), _review_page([], 3)]
+    if failure == "missing":
+        responses[0].headers = {}
+    elif failure == "excessive":
+        responses[0] = _review_page([], 1001)
+    api.incremental_response = MagicMock(side_effect=responses)
+    with pytest.raises(ValueError):
+        api.incremental_pages("/repos/owner/repo/pulls/1/reviews")
 
 
 def test_review_page_failure_cannot_return_a_partial_anchor_list():
     api = RepoApi(MagicMock())
-    api.incremental_json = MagicMock(side_effect=[[review()], ValueError("unavailable")])
+    api.incremental_response = MagicMock(side_effect=[_review_page([review()], 2), ValueError("unavailable")])
     with pytest.raises(ValueError):
         api.incremental_pages("/repos/owner/repo/pulls/1/reviews")
 
@@ -239,18 +266,21 @@ def test_inline_publication_uses_captured_head_not_incomplete_commit_listing(pro
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("previous", [True, False])
-async def test_reviewer_prompt_pipeline_receives_real_delta_or_first_full_fallback(provider, previous, monkeypatch):
+@pytest.mark.parametrize("scenario", ["first", "incremental", "failed_chunk", "omitted", "truncated"])
+async def test_reviewer_prompt_pipeline_receives_real_delta_or_first_full_fallback(provider, scenario, monkeypatch):
     """Run the real diff/token pipeline into a stubbed model, without network/model calls."""
     from pr_agent.tools import pr_reviewer as module
 
     snapshot = snapshot_settings(("config.model", "config.publish_output", "config.is_auto_command",
-                                  "config.enable_ai_metadata", "pr_reviewer.enable_large_pr_chunking"))
+                                  "config.enable_ai_metadata", "pr_reviewer.enable_large_pr_chunking",
+                                  "pr_reviewer.inline_key_issues"))
     try:
+        previous = scenario != "first"
         get_settings().set("config.model", "gpt-4o")
         get_settings().set("config.publish_output", True)
         get_settings().set("config.is_auto_command", True)
         get_settings().set("pr_reviewer.enable_large_pr_chunking", False)
+        get_settings().set("pr_reviewer.inline_key_issues", True)
         if not previous:
             provider.repo_api.incremental_pages.return_value = []
         provider.get_languages = lambda: {"Python": 100}
@@ -259,14 +289,39 @@ async def test_reviewer_prompt_pipeline_receives_real_delta_or_first_full_fallba
         provider.get_pr_branch = lambda: "feature"
         provider.get_pr_description = lambda **kwargs: ("A fake PR", [])
         provider.get_commit_messages = lambda: "change value"
-        provider.pr = SimpleNamespace(title="Fake PR")
+        provider.pr = SimpleNamespace(title="Fake PR", labels=[])
+        provider.base_url_html = "https://forge.example"
+        provider.get_persistent_comment_bodies = lambda: []
+        provider.repo_api.get_pull_request_diff.return_value = (
+            "diff --git a/code.py b/code.py\n--- a/code.py\n+++ b/code.py\n"
+            "@@ -10 +10 @@\n-old\n+new\n"
+        )
+        # Full first reviews exercise a backend rejection; incremental reviews reject
+        # the finding's line before posting because it is outside the full PR hunk.
+        provider.enabled_pr = True
+        provider.last_commit = SimpleNamespace(sha=HEAD)
+        provider.repo_api.create_inline_comment.side_effect = (
+            lambda *args, **kwargs: None if kwargs.get("comments") else object()
+        )
         monkeypatch.setattr(module, "get_git_provider_with_context", lambda _: provider)
         monkeypatch.setattr(module, "build_repo_context", lambda _: "")
         monkeypatch.setattr(module, "get_artifact_context", lambda _: "")
         monkeypatch.setattr(module, "get_skills_context", lambda: "")
         monkeypatch.setattr(module, "extract_and_cache_pr_tickets", AsyncMock())
         monkeypatch.setattr(PRReviewer, "_load_previous_findings_context", lambda _: "")
-        model = AsyncMock(return_value=("review:\n  summary: done", "stop"))
+        async def completion(**kwargs):
+            if scenario == "failed_chunk":
+                reviewer.review_failed_chunk_count = 1
+                reviewer.review_chunk_count = 2
+            elif scenario == "omitted":
+                reviewer.remaining_files_list = ["omitted.py"]
+            elif scenario == "truncated":
+                provider.max_comment_chars = 100
+            return ("review:\n  key_issues_to_review:\n"
+                    "    - relevant_file: code.py\n      start_line: 2\n      end_line: 2\n"
+                    "      issue_header: Wrong value\n      issue_content: Retained inline finding\n", "stop")
+
+        model = AsyncMock(side_effect=completion)
         reviewer = PRReviewer(
             "https://forge.example/owner/repo/pulls/1", args=["-i"], is_auto=True,
             ai_handler=lambda: SimpleNamespace(chat_completion=model),
@@ -277,16 +332,27 @@ async def test_reviewer_prompt_pipeline_receives_real_delta_or_first_full_fallba
                 "", "old_reviewed_change = True\nvalue = 2\n",
                 "@@ -0,0 +1,2 @@\n+old_reviewed_change = True\n+value = 2\n", "code.py"
             )]
-        reviewer._prepare_pr_review = lambda: "## Review"
         reviewer._should_publish_review_no_suggestions = lambda _: True
-        await reviewer.run()
+        with (
+            patch.object(provider, "publish_review_result", wraps=provider.publish_review_result) as publisher,
+            patch.object(
+                provider, "publish_inline_comments", wraps=provider.publish_inline_comments
+            ) as inline_publisher,
+        ):
+            await reviewer.run()
+        assert "Retained inline finding" in publisher.call_args.args[0]
+        assert publisher.call_args.kwargs["complete"] is (scenario not in ("failed_chunk", "omitted"))
+        if scenario != "truncated":
+            inline_publisher.assert_called_once()
+            if previous:
+                provider.repo_api.get_pull_request_diff.assert_called_once()
         model.assert_awaited_once()
         model_input = model.await_args.kwargs["user"]
         assert "+value = 2" in model_input
         assert ("+old_reviewed_change" in model_input) is not previous
         assert reviewer.incremental.is_incremental is previous
         published = provider.repo_api.create_inline_comment.call_args.args[3]
-        assert _CHECKPOINT in published
+        assert (_CHECKPOINT in published) is (scenario in ("first", "incremental"))
         assert ("fell back to the full PR" in published) is not previous
     finally:
         restore_settings(snapshot)

@@ -1105,7 +1105,7 @@ class GiteaProvider(GiteaIncrementalMixin, GitProvider):
         return self.base_sha or self.base_ref
 
 class RepoApi(giteapy.RepositoryApi):
-    def incremental_bytes(self, path: str, query_params=None):
+    def incremental_response(self, path: str, query_params=None):
         """Read fixed-origin metadata without following authenticated redirects."""
         if not path.startswith(("/repos/", "/user")) or "?" in path or "#" in path:
             raise ValueError("Invalid incremental API path")
@@ -1117,20 +1117,39 @@ class RepoApi(giteapy.RepositoryApi):
         )
         if response.status != 200:
             raise ValueError("Gitea incremental metadata request failed")
-        return response.data
+        return response
+
+    def incremental_bytes(self, path: str, query_params=None):
+        return self.incremental_response(path, query_params).data
 
     def incremental_json(self, path: str, query_params=None):
         return json.loads(self.incremental_bytes(path, query_params).decode("utf-8"))
 
     def incremental_pages(self, path: str) -> list:
+        """Walk the underlying review range, not the privacy-filtered response length.
+
+        Forgejo paginates DB reviews before hiding other users' pending reviews. Requesting
+        one record fixes the effective page size even on server-capped instances, so the
+        advertised total bounds the walk without guessing whether an empty page is final.
+        """
         items = []
+        total = None
         for page in range(1, 1001):
-            batch = self.incremental_json(path, [("page", page), ("limit", 50)])
-            if not isinstance(batch, list):
+            response = self.incremental_response(path, [("page", page), ("limit", 1)])
+            batch = json.loads(response.data.decode("utf-8"))
+            if not isinstance(batch, list) or len(batch) > 1:
                 raise ValueError("Invalid incremental metadata page")
-            if not batch:
-                return items
+            headers = {key.lower(): value for key, value in response.headers.items()}
+            advertised = headers.get("x-total-count", "")
+            if not isinstance(advertised, str) or not advertised.isdecimal():
+                raise ValueError("Missing or invalid incremental review count")
+            count = int(advertised)
+            if count > 1000 or (total is not None and total != count) or (count == 0 and batch):
+                raise ValueError("Inconsistent or excessive incremental review count")
+            total = count
             items.extend(batch)
+            if page >= total:
+                return items
         raise ValueError("Incremental metadata pagination limit exceeded")
 
     def __init__(self, client: giteapy.ApiClient):

@@ -117,4 +117,6 @@ can still accept a review attached to the captured older head. Its checkpoint re
 SHA, and a changed target invalidates it on the next run. Incremental inline findings use
 captured-head new-side line numbers and are
 posted only when those lines also belong to the full PR diff; other findings remain in the summary.
+The full-PR position index is reused within an incremental command for the captured head/target
+pair, while revision checks still run before each inline publication attempt.
 `/improve -i` is not enabled by this extension.

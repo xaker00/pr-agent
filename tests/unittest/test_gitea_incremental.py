@@ -9,6 +9,7 @@ from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import IncrementalPR
 from pr_agent.git_providers.gitea_incremental import _CHECKPOINT
 from pr_agent.git_providers.gitea_provider import GiteaProvider, RepoApi
+from pr_agent.mosaico.diff_provider import parse_unified_diff
 from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
@@ -255,6 +256,48 @@ def test_inline_positions_stay_in_full_pr_new_side(provider):
     assert provider._incremental_inline_comments_valid([valid])
     assert not provider._incremental_inline_comments_valid([dict(valid, new_position=1)])
     assert not provider._incremental_inline_comments_valid([dict(valid, old_position=10)])
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\f"])
+def test_inline_position_index_only_counts_lf_delimited_lines(provider, separator):
+    provider.incremental = IncrementalPR(True)
+    provider.repo_api.get_pull_request_diff.return_value = (
+        "diff --git a/code.py b/code.py\n--- a/code.py\n+++ b/code.py\n"
+        f"@@ -10,2 +10,2 @@\n x{separator}+phantom\n-old\n+new\n"
+    )
+    for line, valid in [(10, True), (11, True), (12, False)]:
+        assert provider._incremental_inline_comments_valid([
+            {"path": "code.py", "new_position": line, "old_position": 0}
+        ]) is valid
+
+
+def test_inline_position_index_is_reused_without_losing_revision_checks(provider):
+    provider.incremental = IncrementalPR(True)
+    provider.enabled_pr = True
+    provider.repo_api.get_pull_request_diff.return_value = (
+        "diff --git a/code.py b/code.py\n--- a/code.py\n+++ b/code.py\n"
+        "@@ -10,2 +10,2 @@\n context\n-old\n+new\n"
+    )
+    suggestions = [{"body": "finding", "relevant_file": "code.py", "relevant_lines_start": line}
+                   for line in (10, 11)]
+    with patch("pr_agent.git_providers.gitea_incremental.parse_unified_diff", wraps=parse_unified_diff) as parser:
+        assert provider.publish_code_suggestions(suggestions)
+        provider.repo_api.get_pull_request_diff.assert_called_once()
+        parser.assert_called_once()
+        assert provider.repo_api.get_pull_request.call_count == 3
+        assert provider.repo_api.create_inline_comment.call_count == 2
+        provider.repo_api.get_pull_request.return_value.head.sha = ANCHOR
+        assert not provider.publish_inline_comments([{"path": "code.py", "new_position": 10}])
+        assert provider.repo_api.create_inline_comment.call_count == 2
+        assert provider.repo_api.get_pull_request.call_count == 4
+        parser.assert_called_once()
+        # Starting another incremental command discards the old position index.
+        provider.repo_api.get_pull_request.return_value.head.sha = HEAD
+        provider.get_incremental_commits(IncrementalPR(True))
+        assert provider._incremental_inline_position_cache is None
+        assert provider._incremental_inline_comments_valid([{"path": "code.py", "new_position": 10}])
+        assert provider.repo_api.get_pull_request_diff.call_count == 2
+        assert parser.call_count == 2
 
 
 def test_inline_publication_uses_captured_head_not_incomplete_commit_listing(provider):

@@ -29,6 +29,7 @@ class GiteaIncrementalMixin:
         incremental.last_seen_commit = None
         self.incremental_fallback_reason = "no trusted completed review"
         self._incremental_diff_files = None
+        self._incremental_inline_position_cache = None
         try:
             if not _SHA.fullmatch(self.sha) or not _SHA.fullmatch(self.base_sha):
                 raise ValueError("Missing immutable PR refs")
@@ -181,22 +182,28 @@ class GiteaIncrementalMixin:
         current = self.repo_api.get_pull_request(self.owner, self.repo, self.pr_number)
         if current.head.sha != self.sha or current.base.sha != self.base_sha:
             return False
-        full_diff = self.repo_api.get_pull_request_diff(self.owner, self.repo, self.pr_number)
-        current = self.repo_api.get_pull_request(self.owner, self.repo, self.pr_number)
-        if current.head.sha != self.sha or current.base.sha != self.base_sha:
-            return False
-        positions = {}
-        for file in parse_unified_diff(full_diff):
-            lines = set()
-            new_line = None
-            for line in file.patch.splitlines():
-                if line.startswith("@@"):
-                    match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-                    new_line = int(match[1]) if match else None
-                elif new_line is not None and line.startswith(("+", " ")):
-                    lines.add(new_line)
-                    new_line += 1
-            positions[file.filename] = lines
+        revision = (self.sha, self.base_sha)
+        cached = getattr(self, "_incremental_inline_position_cache", None)
+        if cached is not None and cached[0] == revision:
+            positions = cached[1]
+        else:
+            full_diff = self.repo_api.get_pull_request_diff(self.owner, self.repo, self.pr_number)
+            current = self.repo_api.get_pull_request(self.owner, self.repo, self.pr_number)
+            if current.head.sha != self.sha or current.base.sha != self.base_sha:
+                return False
+            positions = {}
+            for file in parse_unified_diff(full_diff):
+                lines = set()
+                new_line = None
+                for line in file.patch.split("\n"):
+                    if line.startswith("@@"):
+                        match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+                        new_line = int(match[1]) if match else None
+                    elif new_line is not None and line.startswith(("+", " ")):
+                        lines.add(new_line)
+                        new_line += 1
+                positions[file.filename] = lines
+            self._incremental_inline_position_cache = (revision, positions)
         return all(comment.get("old_position", 0) == 0
                    and comment.get("new_position") in positions.get(comment.get("path"), set())
                    for comment in comments)

@@ -38,6 +38,9 @@ Which tools, triggers and core abilities work on each git provider.
 
 Legend: ✅ = supported. 💬 = the tool runs, but its output is posted as a PR comment instead of being applied (Update CHANGELOG where the provider cannot push files, Generate Labels where it cannot set labels). Blank = not supported.
 
+Fork-specific: Gitea/Forgejo also supports native `/review -i` with trusted review checkpoints and
+net commit deltas. See [incremental review behavior and limitations](../installation/gitea.md#incremental-reviews-in-this-fork).
+
 [^tickets]: On Bitbucket Cloud, Bitbucket Server, and Gitea, fetching ticket context means the Jira, Asana, and Linear integrations. Native issue links are used on GitHub and GitLab, and work items on Azure DevOps.
 
 [^help]: `/help <question>` is supported, but `/help` without a question displays an unsupported-format notice instead of the tool list on Bitbucket Cloud, Gerrit and CodeCommit.
